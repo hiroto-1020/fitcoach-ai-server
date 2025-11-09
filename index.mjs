@@ -1,4 +1,5 @@
-﻿// index.mjs — FitCoach Advice Server (variety-focused)
+﻿// index.mjs — adv engine v3（個別最適＋可変表現／任意の後段LLM整形）
+// 必要: npm i express cors
 import express from "express";
 import cors from "cors";
 
@@ -6,193 +7,334 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// ========== utils ==========
-const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-const pct = (num, den) => (den ? Math.round((num / den) * 100) : 0);
+const PORT = process.env.PORT || 10000;
 
-// 安定した“日ごとのバリエーション”のため簡易シード乱数
-function hashStr(s) {
+/* ========== ユーティリティ ========== */
+const N = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+// 文字列→32bit seed
+function hash32(s) {
   let h = 2166136261 >>> 0;
   for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i); h = Math.imul(h, 16777619);
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
   }
   return h >>> 0;
 }
-function mulberry32(seed) {
-  let t = seed >>> 0;
+// シード乱数
+function rng(seed) {
+  let x = seed >>> 0;
   return () => {
-    t += 0x6D2B79F5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+    return (x >>> 0) / 0xFFFFFFFF;
   };
 }
-function pickN(rng, arr, n) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) { // Fisher-Yates
-    const j = Math.floor(rng() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+const pick = (arr, r) => arr[Math.floor(r() * arr.length)];
+function pickN(arr, n, r) {
+  const a = [...arr];
+  const out = [];
+  for (let i = 0; i < n && a.length; i++) {
+    const idx = Math.floor(r() * a.length);
+    out.push(a[idx]);
+    a.splice(idx, 1);
   }
-  return a.slice(0, n);
+  return out;
 }
-function oneOf(rng, arr) { return arr[Math.floor(rng() * arr.length)]; }
 
-// ざっくり食品換算（P/F/Cの補充・抑制の提案に利用）
-const foodIdeas = {
-  protein: [
-    { label: "鶏むね100g", p: 22, kcal: 110 },
-    { label: "ギリシャヨーグルト150g", p: 15, kcal: 120 },
-    { label: "納豆1パック", p: 8, kcal: 100 },
-    { label: "ツナ水煮1缶", p: 12, kcal: 70 },
-    { label: "卵2個", p: 12, kcal: 150 },
-  ],
-  fatDownTips: [
-    "揚げ→グリル/蒸しにチェンジ",
-    "ドレッシングは『かける→和える』で量を1/2",
-    "乳製品は“低脂肪/無脂肪”に置換",
-  ],
-  slowCarb: [
-    "オートミール/玄米/全粒粉パンを小盛りで",
-    "さつまいも100gを主食にスイッチ",
-    "うどん→蕎麦に置換",
-  ],
-  fiberPicks: [
-    "カットサラダ＋海藻を一握り",
-    "冷凍ブロッコリーをレンチン",
-    "りんご/バナナなど果物を1つ",
-  ],
-  konbini: [
-    "セブン：ほぐしサラダチキン＋カットサラダ",
-    "ファミマ：サラダフィッシュ＋味噌汁",
-    "ローソン：ブランパン＋ゆで卵＋野菜ジュース(無加糖)",
-  ],
-  eatingOut: [
-    "牛丼は“並＋サラダ＋味噌汁”で汁は控えめ",
-    "定食は“ご飯少なめ＋刺身/焼き魚/生姜焼き”へ",
-    "ラーメンは“半麺＋味玉＋海苔増し”で満足度キープ",
-  ],
-};
+/* ========== 可変スタイル（口調の揺らぎ） ========== */
+function renderWithStyle(lines, r) {
+  const heads = ["今日のワンポイント👇", "サクッと要点👇", "コーチのひとこと👇", "無理なく整えるヒント👇", ""];
+  const bullets = ["・", "—", "▶", "✓", "◎"];
+  const head = pick(heads, r);
+  const b = pick(bullets, r);
 
-// ========== advice generators ==========
-function buildModules(ctx, rng) {
-  const { totals, goals } = ctx;
-  const pGap = Math.round((goals.proteinTarget ?? 0) - (totals.p ?? 0));   // +なら不足
-  const fOver = Math.round((totals.f ?? 0) - (goals.fatTarget ?? 0));      // +なら摂り過ぎ
-  const kcalDelta = Math.round((totals.kcal ?? 0) - (goals.kcalTarget ?? 0)); // +ならオーバー
-  const cShare = pct(totals.c ?? 0, (totals.p ?? 0) + (totals.f ?? 0) + (totals.c ?? 0));
-
-  const modulo = {
-    proteinUp: () => {
-    if (pGap <= 6) return null;
-      const picks = pickN(rng, foodIdeas.protein, 2).map(x => `${x.label}（P${x.p}g）`);
-      return `タンパク質が少し足りないかも。あと${pGap}gほど、${picks.join(" / ")}のどれかをプラスしてみよう。`;
-    },
-    fatDown: () => {
-      if (fOver <= 5) return null;
-      const tip = oneOf(rng, foodIdeas.fatDownTips);
-      return `脂質は今日ちょい多め（+${fOver}g想定）。${tip} で明日はバランス良く。`;
-    },
-    kcalTrim: () => {
-      if (kcalDelta <= 80) return null;
-      const ways = pickN(rng, ["間食の量を1/2", "主食を小盛りに", "夜の油ものを避ける"], 2).join(" / ");
-      return `今日はカロリーが少し高め（+${kcalDelta}kcal）。${ways} のどれかで微調整しよう。`;
-    },
-    slowCarbTiming: () => {
-      if (cShare >= 35 && cShare <= 55) return null; // おおむねOKなら出さない
-      const pick = oneOf(rng, foodIdeas.slowCarb);
-      return `炭水化物は“ゆっくり吸収”を意識。${pick} をトレ前後に寄せると安定するよ。`;
-    },
-    addFiber: () => {
-      const pick = oneOf(rng, foodIdeas.fiberPicks);
-      return `食物繊維が少なめかも。${pick} を1品足して満腹感と腸内環境をアップ。`;
-    },
-    hydration: () => {
-      const target = clamp(Math.round(((totals.kcal ?? 1800) / 1000) * 1.2 * 10) / 10, 1.2, 3.0);
-      return `水分はこまめに。目安は${target}L/日。食前コップ1杯で食べ過ぎも防げる。`;
-    },
-    sodium: () => {
-      return `外食や加工品が多い日は“汁を残す・ソースは別添え”で塩分オフを意識しよう。`;
-    },
-    konbiniPack: () => {
-      const pick = oneOf(rng, foodIdeas.konbini);
-      return `コンビニなら：${pick} が手軽でP確保しやすいよ。`;
-    },
-    eatingOut: () => {
-      const pick = oneOf(rng, foodIdeas.eatingOut);
-      return `外食Tips：${pick}。満足感キープでPは落とさない。`;
-    },
-    dessertHandle: () => {
-      return `甘い物欲は“食後”に小さめ1品へ。単体間食→血糖スパイクを避けやすい。`;
-    },
-    cookingSwap: () => {
-      return `調理を“揚げ/バター→蒸し/焼き/レンチン”に変えるだけでFを自然に削れるよ。`;
-    },
+  const emoji = (ln) => {
+    let s = ln;
+    if (/(kcal|カロリー|摂取量)/i.test(s)) s += " 🔥";
+    if (/タンパク|P\b/i.test(s)) s += " 🥩";
+    if (/脂質|F\b/i.test(s)) s += " 🧈";
+    if (/炭水化物|C\b|糖質/i.test(s)) s += " 🍚";
+    if (/野菜|食物繊維|フルーツ|果物|発酵食品/i.test(s)) s += " 🥗";
+    if (/水|水分|hydration|飲み物|塩分/i.test(s)) s += " 💧";
+    return s;
   };
 
-  // その日の“雰囲気”を変えるスタイル（文体の彩り）
-  const tones = [
-    { prefix: "メンテ視点", flare: "🔧" },
-    { prefix: "攻めの一手", flare: "⚡" },
-    { prefix: "やさしめ",   flare: "🤝" },
-    { prefix: "科学オタク", flare: "🧪" },
-    { prefix: "シンプル志向", flare: "🎯" },
-  ];
-  const tone = oneOf(rng, tones);
-
-  // 候補生成＆nullを除外
-  const pool = Object.values(modulo).map(fn => fn()).filter(Boolean);
-
-  // バリエーション量は少なめでOK：3〜5本だけ返す
-  const count = 3 + Math.floor(rng() * 3); // 3〜5
-  const picks = pickN(rng, pool.length ? pool : [
-    "今日は全体バランス良さげ。明日はタンパク質だけ“先に食べる”を意識してみよう。",
-    "体調が落ち気味なら睡眠優先で。Pは体重×1.6gくらいを目安に確保。",
-    "炭酸水/お茶で“口寂しさ”対策。間食の量はいつもの半分でOK。",
-  ], count);
-
-  // 記号・見出しもバラす
-  const bullets = ["・", "—", "▶", "✓", "◎"];
-  const b = oneOf(rng, bullets);
-  const introChoices = [
-    `${tone.flare} ${tone.prefix}のミニアドバイス`,
-    `${tone.flare} 今日のワンポイント`,
-    `${tone.flare} さくっと要点`,
-    "", // ときどき前口上ナシ
-  ];
-  const intro = oneOf(rng, introChoices);
-
-  const lines = picks.map(x => `${b}${x}`);
-  return (intro ? intro + "\n" : "") + lines.join("\n");
+  const out = [];
+  if (head) out.push(head);
+  for (const ln of lines) {
+    const line = /^[・—▶✓◎]/.test(ln) ? ln : `${b}${ln}`;
+    out.push(emoji(line));
+  }
+  return out.join("\n");
 }
 
-// ========== endpoints ==========
-app.get("/health", (req, res) => {
+/* ========== 可変テンプレ（重複回避しつつ毎日変わる） ========== */
+function buildAdvice(payload) {
+  const {
+    totals = {}, goals = {}, meals = [], extraContext = {}
+  } = payload || {};
+
+  const t = {
+    kcal: N(totals.kcal), p: N(totals.p), f: N(totals.f), c: N(totals.c),
+  };
+  const g = {
+    kcal: N(goals.kcalTarget), p: N(goals.proteinTarget), f: N(goals.fatTarget), c: N(goals.carbsTarget),
+  };
+
+  // 任意栄養
+  const fiber = N(extraContext?.nutritionExtras?.fiberTotal) ||
+                meals.reduce((s, m) => s + N(m.fiber), 0);
+  const sugar = N(extraContext?.nutritionExtras?.sugarTotal) ||
+                meals.reduce((s, m) => s + N(m.sugar), 0);
+  const sodium = N(extraContext?.nutritionExtras?.sodiumTotal) ||
+                 meals.reduce((s, m) => s + N(m.sodium), 0);
+
+  const isTrainingDay = !!extraContext?.context?.isTrainingDay;
+  const sleepAvg = N(extraContext?.context?.sleepHoursAvg);
+  const streakDays = N(extraContext?.context?.streakDays);
+
+  const latestWeight = N(extraContext?.latestBody?.weight);
+  const latestBodyFat = N(extraContext?.latestBody?.bodyFat);
+  const weightGoal = N(extraContext?.goals?.weightGoal);
+
+  // ギャップ
+  const gap = {
+    kcal: g.kcal ? g.kcal - t.kcal : 0,
+    p: g.p ? g.p - t.p : 0,
+    f: g.f ? g.f - t.f : 0,
+    c: g.c ? g.c - t.c : 0,
+  };
+
+  // しきい値
+  const FIBER_MIN = 18;          // g/日（最低ライン目安）
+  const SUGAR_MAX = 50;          // g/日（WHO目安）
+  const SODIUM_MAX = 2400;       // mg/日（塩分目安）
+  const PROTEIN_LO = 0;          // g（不足ライン）
+  const PROTEIN_MID = 20;        // g（やや不足）
+  const KCAL_TOL = 150;          // kcal 収束許容
+
+  // 可変フレーズプール
+  const pool = [];
+
+  // kcal バランス
+  if (g.kcal) {
+    if (gap.kcal > KCAL_TOL) {
+      pool.push(
+        `まだ ${Math.round(gap.kcal)}kcal 余裕あり。夜は良質なP中心で軽く足そう`,
+        `カロリーは不足ぎみ（＋${Math.round(gap.kcal)}kcal）。無理なく間食で調整を`,
+        `今日は控えめ。あと${Math.round(gap.kcal)}kcalならP寄せでOK`
+      );
+    } else if (gap.kcal < -KCAL_TOL) {
+      pool.push(
+        `やや食べ過ぎ（−${Math.abs(Math.round(gap.kcal))}kcal）。次の食事は油と甘味を控えめに`,
+        `カロリー超過。明日は脂質を5〜10g抑える作戦でリカバリー`,
+        `今日は十分。寝る前の間食は控えて整えよう`
+      );
+    } else {
+      pool.push(
+        `kcalはちょうど良い帯に収束。Pの質だけ意識できれば満点`,
+        `エネルギーバランス良好。明日は野菜/発酵食品をもう一皿`
+      );
+    }
+  }
+
+  // たんぱく質
+  if (g.p) {
+    if (gap.p > PROTEIN_MID) {
+      pool.push(
+        `Pが足りない（あと${Math.round(gap.p)}g）。鶏むね/卵/ギリシャヨーグルトで補強`,
+        `たんぱく不足。就寝前にプロテイン20g or 低脂肪乳`,
+        `P追い足し推奨：ツナ缶/納豆/豆腐を一品追加`
+      );
+    } else if (gap.p > PROTEIN_LO) {
+      pool.push(
+        `Pはあと少し（${Math.round(gap.p)}g）。次の食事でメインをPに寄せよう`,
+        `P微調整。サラダにサラダチキン/豆をトッピング`
+      );
+    } else {
+      pool.push(
+        `Pは合格。脂質が上振れしないよう部位/調理法を意識`,
+        `十分なたんぱく摂取。吸収を助ける発酵食品も◎`
+      );
+    }
+  }
+
+  // 脂質
+  if (g.f) {
+    if (gap.f < -5) {
+      pool.push(
+        `脂質がやや多め（${Math.abs(Math.round(gap.f))}g）。揚げ物とドレッシング量を見直し`,
+        `F過多の気配。次回は焼く/茹でる調理で調整`
+      );
+    } else if (gap.f > 5) {
+      pool.push(
+        `脂質少なめ。オメガ3系（サバ/サーモン/亜麻仁）を少し足すと◎`,
+        `Fが足りないならナッツ10〜15gで質を上げて満足度もUP`
+      );
+    }
+  }
+
+  // 炭水化物
+  if (g.c) {
+    if (gap.c > 20) {
+      pool.push(
+        `C不足（＋${Math.round(gap.c)}g）。トレ前はおにぎり/バナナでパフォーマンス維持`,
+        `炭水化物が控えめ。主食を拳1/2分だけ増やしてみよう`
+      );
+    } else if (gap.c < -20) {
+      pool.push(
+        `C過多（−${Math.abs(Math.round(gap.c))}g）。甘味・汁物の糖を軽く調整`,
+        `主食がやや多い日。明日は野菜とPを優先でバランス取り`
+      );
+    }
+  }
+
+  // 食物繊維・糖・塩分
+  if (fiber && fiber < FIBER_MIN) {
+    pool.push(
+      `食物繊維が少なめ（${Math.round(fiber)}g）。海藻/きのこ/豆/皮つき野菜で＋5〜8gを狙おう`,
+      `繊維UPのチャンス：味噌汁にわかめ＆豆腐、サラダに豆/ブロッコリー`
+    );
+  }
+  if (sugar && sugar > SUGAR_MAX) {
+    pool.push(
+      `糖が多め（${Math.round(sugar)}g）。飲料の糖とデザート頻度を見直し`,
+      `甘味コントロール：フルーツは食後の少量に寄せて血糖急上昇を抑制`
+    );
+  }
+  if (sodium && sodium > SODIUM_MAX) {
+    pool.push(
+      `塩分が多い傾向（${Math.round(sodium)}mg）。汁物/加工肉/惣菜の頻度を控えめに`,
+      `減塩テク：出汁の旨味を強めて醤油/塩を自然に減らす`
+    );
+  }
+
+  // トレ日・睡眠・継続
+  if (isTrainingDay) {
+    pool.push(
+      `トレ日ならPは3回以上に分散。Cはトレ前後へ重点配分`,
+      `ワークアウト後はP20〜30g＋ややCで回復を後押し`
+    );
+  }
+  if (sleepAvg) {
+    if (sleepAvg < 6) {
+      pool.push(
+        `睡眠短め（${sleepAvg}h）。夕食は消化の軽いP中心にして睡眠の質を上げよう`,
+        `寝不足気味。カフェインは15時以降を控えめにして深部体温を整える`
+      );
+    } else {
+      pool.push(
+        `睡眠は十分（${sleepAvg}h）。朝はP＋水分で代謝スタートをスムーズに`,
+        `休息が取れている日。摂取は目標の範囲でOK`
+      );
+    }
+  }
+  if (streakDays) {
+    pool.push(
+      `記録${streakDays}日継続中◎ 小さな一貫性が体を作る`,
+      `継続は正義（${streakDays}日）。今日は「油の質」だけ意識してみよう`
+    );
+  }
+
+  // 体重・体脂肪の方向性
+  if (weightGoal && latestWeight) {
+    const diff = Math.round((latestWeight - weightGoal) * 10) / 10;
+    if (diff > 0.5) {
+      pool.push(
+        `目標体重まで −${diff}kg。まずは脂質を日あたり5〜10g抑えて様子見`,
+        `体重は緩やかに。空腹時の間食はプロテイン/ゆで卵で質を担保`
+      );
+    } else if (diff < -0.5) {
+      pool.push(
+        `やせ過ぎ気味（${diff}kg）。kcalを＋150〜200でPは維持、Cを少し足す`,
+        `体重が目標を下回り傾向。トレ後のCを確保して回復優先`
+      );
+    } else {
+      pool.push(
+        `体重は目標ライン付近。現状の型を続けつつ塩分/繊維で質を高めよう`,
+        `狙い通りのペース。次はビタミン/ミネラル源（野菜/海藻）で微調整`
+      );
+    }
+  }
+  if (latestBodyFat) {
+    pool.push(
+      `体脂肪${latestBodyFat}%。Pは体重×1.6〜2.2g/日を目安に分散補給`,
+      `体脂肪率に合わせて有酸素は短時間×高頻度のほうが継続しやすい`
+    );
+  }
+
+  // シード（ユーザー×日で変化）
+  const userId = String(extraContext?.user?.id || "anon");
+  const seed = hash32(userId + ":" + todayISO());
+  const r = rng(seed);
+
+  // 4〜6行をランダム抽出（重複回避）
+  const lines = pickN(Array.from(new Set(pool)), 4 + Math.floor(r() * 3), r);
+
+  // 後段LLM（任意）— 無設定ならスキップ
+  // 例）OLLAMA_BASE=http://localhost:11434  OLLAMA_MODEL=llama3.1
+  // 例）POST_EDITOR_URL=https://your-free-endpoint.example.com/rewrite
+  async function postEdit(text) {
+    try {
+      if (process.env.POST_EDITOR_URL) {
+        const res = await fetch(process.env.POST_EDITOR_URL, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text })
+        });
+        if (res.ok) {
+          const json = await res.json().catch(() => ({}));
+          if (json?.text) return String(json.text);
+        }
+      } else if (process.env.OLLAMA_BASE) {
+        const base = process.env.OLLAMA_BASE.replace(/\/+$/, "");
+        const model = process.env.OLLAMA_MODEL || "llama3.1";
+        const res = await fetch(`${base}/api/generate`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model, prompt: `次の日本語の箇条書きを、語尾と表現が被らないよう自然に整えてください。内容は変えず、出力はそのままテキストで:\n${renderWithStyle(lines, r)}`
+          })
+        });
+        if (res.ok) {
+          const t = await res.text();
+          // Ollamaは逐次JSON行。最後のresponseを拾う
+          const last = t.trim().split("\n").filter(Boolean).map(j => {
+            try { return JSON.parse(j); } catch { return {}; }
+          }).filter(o => o.response).map(o => o.response).join("");
+          if (last) return last;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  return { lines, r, postEdit };
+}
+
+/* ========== エンドポイント ========== */
+app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
-app.post("/warmup", (req, res) => {
-  // 将来的にモデルロード等を入れる想定。今はNO-OP
-  return res.json({ ok: true });
-});
 
-app.post("/advice", (req, res) => {
+app.post("/advice", async (req, res) => {
   try {
-    const { totals = {}, goals = {}, meals = [], template, variant, seed } = req.body || {};
-    const dateSeed = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    const seedStr = String(seed ?? variant ?? `${dateSeed}|${totals.kcal}|${totals.p}|${totals.f}|${totals.c}`);
-    const rng = mulberry32(hashStr(seedStr));
-    const ctx = { totals, goals, meals, template };
+    const { lines, r, postEdit } = buildAdvice(req.body || {});
+    // スタイル適用
+    const styled = renderWithStyle(lines, r);
 
-    const text = buildModules(ctx, rng);
-    // クライアントは“生テキスト”前提
-    return res.json({ advice: text });
+    // 任意の後段整形
+    const edited = await postEdit(styled);
+    const text = edited ? edited.trim() : styled.trim();
+
+    res.json({ advice: text });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "advice-failed" });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ========== start ==========
-const PORT = process.env.PORT || 10000;
+app.post("/warmup", (_req, res) => res.json({ ok: true, warmed: true }));
+
 app.listen(PORT, () => {
-  console.log(`[fitcoach-ai-server] listening on ${PORT}`);
+  console.log(`AI advice server listening on :${PORT}`);
 });
